@@ -1,0 +1,35 @@
+{
+    "aggregate_api_key": {
+        "description": "聚合解析 API 密钥",
+        "type": "string",
+        "hint": "填写聚合解析接口的 apikey，用于 /jx 指令。",
+        "default": "",
+        "obvious_hint": true
+    },
+    "douyin_profile_api_key": {
+        "description": "抖音主页解析 API 密钥",
+        "type": "string",
+        "hint": "填写抖音主页解析接口的 apikey，用于 /dyhome 指令。",
+        "default": "",
+        "obvious_hint": true
+    },
+    "collection_email": {
+        "description": "收藏解析通知邮箱",
+        "type": "string",
+        "hint": "抖音收藏解析提交后台任务时使用的邮箱。",
+        "default": "",
+        "obvious_hint": true
+    },
+    "collection_filename": {
+        "description": "收藏解析导出文件名",
+        "type": "string",
+        "hint": "抖音收藏解析提交后台任务时使用的导出文件名。",
+        "default": ""
+    },
+    "debug_mode": {
+        "description": "调试模式",
+        "type": "bool",
+        "hint": "开启后输出更多调试信息。",
+        "default": false
+    }
+}
