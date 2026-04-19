@@ -6,7 +6,7 @@ AstrBot 聚合解析插件。
 
 - 聚合解析
 - 抖音主页解析
-- 抖音收藏解析（默认停用，需独立部署）
+- 抖音收藏解析（推荐独立部署）
 
 核心实现位于 [`main.py`](README.md)，插件元数据位于 [`metadata.yaml`](metadata.yaml)。
 
@@ -16,9 +16,13 @@ AstrBot 聚合解析插件。
 | --- | --- | --- |
 | `/jx 分享链接` | 聚合解析，返回视频或图片资源链接 | 可用 |
 | `/dyhome 抖音主页分享文本或链接` | 解析抖音主页并生成本地 TXT 文件 | 可用 |
+| `/dytrack 抖音主页分享文本或链接` | 将旧主页链接补录进更新记录 | 可用 |
+| `/dytarget` | 绑定自动更新完成后的主动推送目标会话 | 可用 |
 | `/dyplay 文件名` | 顺序播放指定 TXT 中的视频链接 | 可用 |
-| `/dycollection 抖音分享文本` | 抖音收藏解析 | 默认停用 |
-| `/dycollection_query 任务ID` | 抖音收藏任务查询 | 默认停用 |
+| `/dyupdate` | 串行更新所有已记录的抖音主页，并逐条回报结果 | 可用 |
+| `/dyupdateone 作者名或文件名` | 按名字匹配单个主页记录并更新 | 可用 |
+| `/dycollection [favorite\|collection]` | 提交抖音点赞/收藏后台解析任务 | 可用 |
+| `/dycollection_query 任务ID` | 查询抖音点赞/收藏任务结果 | 可用 |
 
 ## 功能说明
 
@@ -31,6 +35,7 @@ AstrBot 聚合解析插件。
   - 自动识别常见平台
   - 仅返回视频和图片链接
   - 尽量过滤无关字段
+  - 图集内容支持发送群/私聊合并转发消息
 
 ### 抖音主页解析
 
@@ -39,7 +44,49 @@ AstrBot 聚合解析插件。
 - 特性：
   - 调用抖音主页解析接口
   - 将作品链接保存为本地 TXT 文件
+  - 自动记录已解析过的主页分享文本/链接
   - 回复中仅保留下载信息与文件信息
+  - 生产环境推荐独立部署使用，以获得更稳定的解析效果
+
+### 抖音主页批量更新
+
+- 指令：`/dyupdate`
+- 处理方式：按已记录的主页顺序逐个重新请求解析接口
+- 特性：
+  - 已解析过的主页会持久化记录到 [`douyin_profile_records.json`](douyin_profile_records.json)
+  - 后台按顺序轮播更新，一次只更新一个主页
+  - 每完成一个主页更新，就立即回复一条结果
+  - 某个主页失败不会中断后续主页更新
+
+### 抖音主页单个更新
+
+- 指令：`/dyupdateone 作者名或文件名`
+- 用途：按记录中的作者名或 TXT 文件名匹配单个主页，然后只更新这一条
+- 说明：
+  - 支持直接输入作者名
+  - 也支持输入 TXT 文件名或去掉 `.txt` 后的名称
+  - 匹配到后会只更新这一条记录并单独返回结果
+
+### 旧主页补录
+
+- 指令：`/dytrack 抖音主页分享文本或链接`
+- 用途：把历史上已经解析过、但当时还没有记录下来的主页手动补录进更新列表
+- 说明：
+  - 该命令只负责登记主页链接，不会立即发起解析
+  - 补录成功后，可通过 [`/dyupdate`](README.md) 手动更新
+  - 也可等待插件配置中的自动更新时间点触发自动更新
+
+### 抖音主页定时自动更新
+
+- 触发方式：通过配置中的时间点自动执行
+- 行为说明：
+  - 自动更新使用与 [`/dyupdate`](README.md) 相同的主页记录
+  - 每天到达设定时间后自动执行一轮串行更新
+  - 为避免重复触发，同一天只会执行一次
+  - 自动更新结果会写入插件日志，已有主页记录仍然全部兼容，无需重新录入
+  - 自动更新时间不是聊天命令设置，而是在插件配置中设置
+  - 自动更新支持在每个主页请求之间增加等待间隔，降低后端短时间高频请求风险
+  - 如需自动更新结束后主动推送汇总消息，请先在目标群聊/频道执行一次 [`/dytarget`](README.md)
 
 示例返回：
 
@@ -55,49 +102,17 @@ AstrBot 聚合解析插件。
 - 文件名提取：[`MediaParserPlugin._extract_file_name()`](main.py:471)
 - 域名转大写：[`MediaParserPlugin._uppercase_domain()`](main.py:542)
 
-### 抖音收藏解析
+### 抖音点赞/收藏解析
 
-> [!WARNING]
-> 收藏解析功能已在插件内默认停用。该能力不能直接对接 `douyin.zhcnli.cn`，必须通过独立部署环境提供。
-
-- 停用处理函数：[`MediaParserPlugin.douyin_collection_parse()`](main.py:125)
-- 停用处理函数：[`MediaParserPlugin.douyin_collection_query()`](main.py:134)
-- 独立部署说明：<https://blog.zhcnli.com/876.html>
-
-当前插件中如果调用相关指令，仅会提示用户该功能不能直接对接 [`douyin.zhcnli.cn`](README.md:61)，并引导前往独立部署说明页面。
-
-#### 如何取消注释并启用
-
-如需重新启用收藏解析命令，需要修改 [`main.py`](main.py) 中这两个函数上方被注释掉的装饰器：
-
-```python
-# @filter.command("dycollection")
-async def douyin_collection_parse(self, event: AstrMessageEvent):
-
-# @filter.command("dycollection_query")
-async def douyin_collection_query(self, event: AstrMessageEvent):
-```
-
-将其改回：
-
-```python
-@filter.command("dycollection")
-async def douyin_collection_parse(self, event: AstrMessageEvent):
-
-@filter.command("dycollection_query")
-async def douyin_collection_query(self, event: AstrMessageEvent):
-```
-
-对应位置：
-
-- [`MediaParserPlugin.douyin_collection_parse()`](main.py:125)
-- [`MediaParserPlugin.douyin_collection_query()`](main.py:134)
-
-启用后说明：
-
-1. 取消注释后，AstrBot 才会重新注册 `/dycollection` 与 `/dycollection_query` 指令。
-2. 当前函数内部已改为“仅提示独立部署”的返回逻辑；如果你要恢复真实收藏解析能力，还需要把这两个函数的提示逻辑改回原本的接口请求逻辑。
-3. 抖音收藏功能不能直接对接 `douyin.zhcnli.cn` 现有接口，必须使用独立部署方案，建议优先参考 [独立部署说明](https://blog.zhcnli.com/876.html)。
+- 提交指令：`/dycollection [favorite|collection]`
+- 查询指令：`/dycollection_query 任务ID`
+- 说明：
+  - 通过 [`douyin_account_cookie`](_conf_schema.json) 提交后台任务
+  - `favorite` 表示喜欢作品，`collection` 表示收藏作品
+  - 仅支持解析当前 Cookie 对应账号自己的点赞/收藏内容
+  - 若配置了 [`collection_email`](_conf_schema.json)，提交任务时会附带 `email` 参数作为异步完成通知邮箱
+  - 解析完成后返回 TXT 下载链接
+  - 如需更稳定长期使用，推荐独立部署
 
 ## 配置说明
 
@@ -111,14 +126,46 @@ async def douyin_collection_query(self, event: AstrMessageEvent):
 ```json
 {
   "aggregate_api_key": "你的聚合解析密钥",
-  "douyin_profile_api_key": "你的抖音主页解析密钥"
+  "douyin_profile_api_key": "你的抖音主页解析密钥",
+  "douyin_profile_timeout": 60,
+  "douyin_profile_auto_update_enabled": false,
+  "douyin_profile_auto_update_time": "03:30",
+  "douyin_account_cookie": "你的抖音登录Cookie",
+  "douyin_account_mode": "collection",
+  "douyin_account_filename": "我的收藏.txt"
 }
 ```
 
 字段说明：
 
 - [`aggregate_api_key`](_conf_schema.json)：聚合解析接口密钥
+- [`forward_node_uin`](_conf_schema.json)：图集合并转发显示使用的 QQ 号
+- [`forward_node_name`](_conf_schema.json)：图集合并转发显示使用的名称
 - [`douyin_profile_api_key`](_conf_schema.json)：抖音主页解析接口密钥
+- [`douyin_profile_timeout`](_conf_schema.json)：主页解析超时时间（秒）
+- [`douyin_profile_auto_update_enabled`](_conf_schema.json)：是否开启定时自动更新
+- [`douyin_profile_auto_update_time`](_conf_schema.json)：每天自动更新的时间点，格式 `HH:MM`
+- [`douyin_profile_auto_update_interval`](_conf_schema.json)：自动更新时相邻两个主页请求之间的等待秒数，默认 30 秒
+- [`douyin_profile_auto_update_push_hint`](_conf_schema.json)：自动更新主动推送绑定提示
+- [`douyin_account_cookie`](_conf_schema.json)：抖音账号 Cookie，仅用于解析当前账号自己的点赞/收藏内容
+- [`douyin_account_mode`](_conf_schema.json)：`/dycollection` 默认模式，支持 `favorite` 和 `collection`
+- [`douyin_account_filename`](_conf_schema.json)：点赞/收藏导出 TXT 文件名
+
+补充说明：
+
+- 如果旧版本解析主页时还没有建立记录文件，可使用 `/dytrack 抖音主页分享文本或链接` 手动补录。
+- 自动更新时间点统一在 AstrBot 的插件配置界面中设置，对应字段为 [`douyin_profile_auto_update_time`](_conf_schema.json:38)。
+- 如果需要自动更新完成后主动通知固定会话，请先在目标会话执行 [`/dytarget`](README.md) 绑定，插件会保存该会话的 `unified_msg_origin` 并在后台任务完成后主动推送汇总消息。
+
+### 聚合解析图集合并转发
+
+- 当 [`/jx`](README.md) 解析到图集或多图内容时：
+  - 会先发送一条简要解析说明
+  - 再发送一条群/私聊合并转发消息
+  - 该合并转发消息只包含 **一个** [`Node`](main.py) 节点，节点内容里合并全部图片，而不是一张图片一个节点
+- OneBot v11 场景下，可通过配置项设置合并转发显示身份：
+  - [`forward_node_uin`](_conf_schema.json)
+  - [`forward_node_name`](_conf_schema.json)
 
 API Key 获取地址：
 
@@ -137,21 +184,33 @@ API Key 获取地址：
 
 字段说明：
 
-- [`collection_email`](_conf_schema.json)：抖音收藏任务提交时使用的邮箱
+- [`collection_email`](_conf_schema.json)：抖音点赞/收藏任务提交时使用的异步通知邮箱
 - [`collection_filename`](_conf_schema.json)：抖音收藏任务提交时使用的导出文件名
 - [`debug_mode`](_conf_schema.json)：是否开启调试模式
 
 说明：
 
-- 当前版本不会直接启用抖音收藏解析流程，上述收藏相关配置仅供独立部署方案对接时参考。
+- 抖音主页解析与抖音点赞/收藏解析在生产环境中推荐独立部署，以获得更稳定的可用性与接口控制能力。
 - 如果未填写 [`aggregate_api_key`](_conf_schema.json) 或 [`douyin_profile_api_key`](_conf_schema.json)，对应指令会直接提示“未配置 API 密钥”。
 
 ## 文件结构
 
 - [`main.py`](main.py)：插件主逻辑
+- [`douyin_profile_records.json`](douyin_profile_records.json)：已解析主页记录文件（运行后自动生成）
 - [`metadata.yaml`](metadata.yaml)：插件元数据
 - [`README.md`](README.md)：项目说明文档
 - [`_conf_schema.json`](_conf_schema.json)：AstrBot 配置界面 schema
+
+## 赞助
+
+如果这个项目对你有帮助，欢迎赞助支持。
+
+> [!NOTE]
+> 赞助二维码图片后续补充，当前先保留占位链接。
+
+![赞助二维码](https://blog.zhcnli.com/wp-content/uploads/2026/04/20260419122856231-sponsor-placeholder.jpg)
+
+- 赞助图片链接：<https://blog.zhcnli.com/wp-content/uploads/2026/04/20260419122856231-sponsor-placeholder.jpg>
 
 ## 相关链接
 

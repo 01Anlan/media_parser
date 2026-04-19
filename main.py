@@ -1,14 +1,18 @@
 import json
 import os
+import random
 import re
 import time
+import asyncio
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, unquote
 from urllib.request import Request, urlopen
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Plain, Video
+from astrbot.api.event import MessageChain
+from astrbot.api.message_components import Image, Node, Plain, Video
 from astrbot.api.star import Context, Star, register
 
 
@@ -21,28 +25,44 @@ DOUYIN_PROFILE_API = (
     "?apikey={apikey}&url="
 )
 DOUYIN_COLLECTION_API = (
-    "http://你的域名/api"
+    "https://douyin.zhcnli.cn/account_cookie.php"
     "?apikey={apikey}"
 )
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+PROFILE_RECORD_FILE = os.path.join(BASE_DIR, "douyin_profile_records.json")
+AUTO_UPDATE_TARGET_FILE = os.path.join(BASE_DIR, "auto_update_target.json")
+AUTO_UPDATE_STATE_FILE = os.path.join(BASE_DIR, "auto_update_state.json")
+DEFAULT_REQUEST_TIMEOUT = 20
+DEFAULT_DOUYIN_PROFILE_TIMEOUT = 60
+DEFAULT_AUTO_UPDATE_INTERVAL = 30
 
 
-@register("astrbot_plugin_media_parser", "Anlan", "聚合解析与抖音主页解析插件", "2.0.0")
+@register("astrbot_plugin_media_parser", "Anlan", "聚合解析与抖音主页解析插件", "v5.2.3")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self.play_indexes: Dict[str, int] = {}
+        self.play_history: Dict[str, List[int]] = {}
+        self.profile_records: List[Dict[str, Any]] = self._load_profile_records()
+        self.auto_update_target = self._load_auto_update_target()
+        self.auto_update_state = self._load_auto_update_state()
+        self.auto_update_task: Optional[asyncio.Task] = None
+        self.auto_update_running = False
+        self.last_auto_update_date = str(self.auto_update_state.get("last_auto_update_date") or "")
+        self.last_auto_update_check_date = str(self.auto_update_state.get("last_auto_update_check_date") or "")
         self.config.save_config()
 
     async def initialize(self):
         logger.info("media_parser 插件已初始化")
+        if not self.auto_update_task or self.auto_update_task.done():
+            self.auto_update_task = asyncio.create_task(self._auto_update_loop())
 
     @filter.command("jx")
     async def aggregate_parse(self, event: AstrMessageEvent):
-        """聚合解析：输入分享链接，仅返回视频和图片资源。"""
+        """聚合解析：输入分享链接，优先直接发送视频；图集/多图使用合并转发节点发送。"""
         target_url = self._extract_url(event.message_str)
         if not target_url:
             yield event.plain_result("用法：/jx 分享链接")
@@ -61,7 +81,27 @@ class MediaParserPlugin(Star):
             yield event.plain_result(f"聚合解析失败：{exc}")
             return
 
+        data = payload.get("data") or {}
         message = self._format_aggregate_result(payload)
+        video_url = self._pick_video_url(data) if isinstance(data, dict) else None
+        image_urls = self._pick_image_urls(data) if isinstance(data, dict) else []
+
+        if video_url:
+            playable_url = self._resolve_direct_media_url(video_url)
+            yield event.plain_result(message)
+            yield event.chain_result([Video.fromURL(playable_url)])
+            return
+
+        if image_urls:
+            yield event.plain_result(self._format_aggregate_summary(payload, include_image_links=False))
+            if self._supports_forward_node(event):
+                node = self._build_aggregate_image_forward_node(data if isinstance(data, dict) else {}, image_urls)
+                yield event.chain_result([node])
+            else:
+                for image_url in image_urls:
+                    yield event.chain_result([Image.fromURL(image_url)])
+            return
+
         yield event.plain_result(message)
 
     @filter.command("dyhome")
@@ -78,8 +118,10 @@ class MediaParserPlugin(Star):
             return
 
         try:
-            api_url = DOUYIN_PROFILE_API.format(apikey=quote(douyin_profile_api_key, safe="")) + quote(raw_text, safe="")
-            payload = self._request_json(api_url)
+            api_url = self._build_douyin_profile_api(raw_text, douyin_profile_api_key)
+            profile_timeout = self._get_douyin_profile_timeout()
+            payload = self._request_json(api_url, timeout=profile_timeout)
+            self._upsert_profile_record(raw_text, payload)
         except Exception as exc:
             logger.exception("抖音主页解析失败: %s", exc)
             yield event.plain_result(f"抖音主页解析失败：{exc}")
@@ -88,6 +130,97 @@ class MediaParserPlugin(Star):
         download_info = self._save_profile_txt(payload)
         message = self._format_douyin_profile_result(payload, download_info)
         yield event.plain_result(message)
+
+    @filter.command("dyupdate")
+    async def douyin_profile_update_all(self, event: AstrMessageEvent):
+        """按记录顺序逐个更新已解析过的抖音主页。"""
+        if not self.profile_records:
+            yield event.plain_result("暂无已记录的抖音主页，先使用 /dyhome 解析后再执行 /dyupdate")
+            return
+
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            yield event.plain_result("未配置抖音主页解析 API 密钥")
+            return
+
+        total = len(self.profile_records)
+        yield event.plain_result(f"开始后台顺序更新 {total} 个抖音主页记录")
+
+        for message in self._iter_profile_update_messages(douyin_profile_api_key):
+            yield event.plain_result(message)
+
+    @filter.command("dyupdateone")
+    async def douyin_profile_update_one(self, event: AstrMessageEvent):
+        """按作者名或文件名匹配单个主页记录并更新。"""
+        keyword = self._extract_dyupdateone_text(event.message_str)
+        if not keyword:
+            yield event.plain_result("用法：/dyupdateone 作者名或文件名")
+            return
+
+        if not self.profile_records:
+            yield event.plain_result("暂无已记录的抖音主页，先使用 /dyhome 解析后再执行 /dyupdateone")
+            return
+
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            yield event.plain_result("未配置抖音主页解析 API 密钥")
+            return
+
+        matched_record = self._find_profile_record_by_keyword(keyword)
+        if not matched_record:
+            yield event.plain_result(f"未找到匹配记录：{keyword}")
+            return
+
+        display_name = str(matched_record.get("author") or matched_record.get("file_name") or keyword).strip()
+        yield event.plain_result(f"开始更新：{display_name}")
+        result_message = self._update_single_profile_record(douyin_profile_api_key, matched_record, index=1, total=1)
+        yield event.plain_result(result_message)
+
+    @filter.command("dytarget")
+    async def bind_auto_update_target(self, event: AstrMessageEvent):
+        """绑定自动更新结果主动推送目标会话。"""
+        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not unified_msg_origin:
+            yield event.plain_result("当前会话不支持绑定自动更新推送目标")
+            return
+
+        self.auto_update_target = {"unified_msg_origin": unified_msg_origin}
+        self._save_auto_update_target()
+        yield event.plain_result(
+            "✅ 已绑定自动更新推送会话\n"
+            "📌 后续定时自动更新完成后，会主动向当前会话发送一条汇总消息"
+        )
+
+    @filter.command("dytrack")
+    async def douyin_profile_track(self, event: AstrMessageEvent):
+        """补录旧的抖音主页分享文本或链接到更新记录中。"""
+        raw_text = self._extract_dytrack_text(event.message_str)
+        if not raw_text:
+            yield event.plain_result("用法：/dytrack 抖音主页分享文本或链接")
+            return
+
+        record = self._upsert_profile_record(raw_text)
+        yield event.plain_result(
+            "✅ 已加入主页更新记录\n"
+            f"🔗 主页：{self._sanitize_markdown_text(str(record.get('raw_text', '') or ''))}\n"
+            "📌 之后可通过 /dyupdate 或定时自动更新进行刷新"
+        )
+
+    @filter.command("dymenu")
+    async def douyin_profile_menu(self, event: AstrMessageEvent):
+        """展示已保存的抖音主页播放菜单。"""
+        txt_files = self._list_download_txt_files()
+        if not txt_files:
+            yield event.plain_result(
+                "┏━🎵 抖音主页菜单 ━┓\n"
+                "  暂无可播放的主页记录\n"
+                "  先用 /dyhome 解析主页\n"
+                "  再用 /dyplay 文件名 播放\n"
+                "┗━━━━━━━━━━━━━━┛"
+            )
+            return
+
+        yield event.plain_result(self._format_douyin_menu(txt_files))
 
     @filter.command("dyplay")
     async def douyin_profile_play(self, event: AstrMessageEvent):
@@ -113,17 +246,23 @@ class MediaParserPlugin(Star):
             yield event.plain_result("TXT 文件为空")
             return
 
-        current_index = self.play_indexes.get(file_path, 0)
-        if current_index >= len(urls):
-            current_index = 0
+        play_mode = str(self.config.get("douyin_profile_play_mode", "sequential") or "sequential").strip().lower()
+        if play_mode == "random":
+            current_index = self._pick_random_play_index(file_path, len(urls))
+        else:
+            current_index = self.play_indexes.get(file_path, 0)
+            if current_index >= len(urls):
+                current_index = 0
+            self.play_indexes[file_path] = current_index + 1
 
         current_url = urls[current_index]
-        self.play_indexes[file_path] = current_index + 1
 
         playable_url = self._resolve_direct_media_url(current_url)
+        play_mode_label = "随机播放" if play_mode == "random" else "顺序播放"
         message_chain = [
             Plain(
                 f"🎬 正在播放：{os.path.basename(file_path)}\n"
+                f"▶️ 播放模式：{play_mode_label}\n"
                 f"📍 当前进度：{current_index + 1}/{len(urls)}\n"
                 f"🔗 视频直链：{playable_url}"
             ),
@@ -131,23 +270,62 @@ class MediaParserPlugin(Star):
         ]
         yield event.chain_result(message_chain)
 
-    # @filter.command("dycollection")
+    @filter.command("dycollection")
     async def douyin_collection_parse(self, event: AstrMessageEvent):
-        """抖音收藏解析：无法直接对接 douyin.zhcnli.cn，需独立部署。"""
-        yield event.plain_result(
-            "抖音收藏解析功能无法直接对接 douyin.zhcnli.cn；该能力必须独立部署后使用。\n"
-            "部署说明请查看：https://blog.zhcnli.com/876.html"
-        )
+        """抖音点赞/收藏解析：基于已配置的账号 Cookie 提交后台任务。"""
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            yield event.plain_result("未配置抖音主页解析 API 密钥")
+            return
 
-    # @filter.command("dycollection_query")
+        cookie = str(self.config.get("douyin_account_cookie", "") or "").strip()
+        if not cookie:
+            yield event.plain_result("未配置抖音账号 Cookie，无法解析点赞/收藏内容")
+            return
+
+        mode = self._extract_collection_mode(event.message_str) or str(
+            self.config.get("douyin_account_mode", "collection") or "collection"
+        ).strip().lower()
+        if mode not in {"favorite", "collection"}:
+            yield event.plain_result("模式无效，仅支持 favorite（点赞）或 collection（收藏）")
+            return
+
+        filename = self._build_account_export_filename(mode)
+        email = str(self.config.get("collection_email", "") or "").strip()
+        try:
+            submit_api = self._build_account_cookie_submit_api(douyin_profile_api_key, cookie, mode, filename, email)
+            payload = self._request_json(submit_api, timeout=self._get_douyin_profile_timeout())
+        except Exception as exc:
+            logger.exception("抖音点赞/收藏任务提交失败: %s", exc)
+            yield event.plain_result(f"抖音点赞/收藏任务提交失败：{exc}")
+            return
+
+        yield event.plain_result(self._format_account_cookie_submit_result(payload, mode, filename, email))
+
+    @filter.command("dycollection_query")
     async def douyin_collection_query(self, event: AstrMessageEvent):
-        """抖音收藏查询：无法直接对接 douyin.zhcnli.cn，需独立部署。"""
-        yield event.plain_result(
-            "抖音收藏查询功能无法直接对接 douyin.zhcnli.cn；该能力必须独立部署后使用。\n"
-            "部署说明请查看：https://blog.zhcnli.com/876.html"
-        )
+        """查询抖音点赞/收藏后台任务状态。"""
+        job_id = self._extract_collection_query_text(event.message_str)
+        if not job_id:
+            yield event.plain_result("用法：/dycollection_query 任务ID")
+            return
 
-    def _request_json(self, url: str) -> Dict[str, Any]:
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            yield event.plain_result("未配置抖音主页解析 API 密钥")
+            return
+
+        try:
+            query_api = self._build_account_cookie_query_api(douyin_profile_api_key, job_id)
+            payload = self._request_json(query_api, timeout=self._get_douyin_profile_timeout())
+        except Exception as exc:
+            logger.exception("抖音点赞/收藏任务查询失败: %s", exc)
+            yield event.plain_result(f"抖音点赞/收藏任务查询失败：{exc}")
+            return
+
+        yield event.plain_result(self._format_account_cookie_query_result(payload, job_id))
+
+    def _request_json(self, url: str, timeout: Optional[int] = None) -> Dict[str, Any]:
         request = Request(
             url,
             headers={
@@ -156,13 +334,362 @@ class MediaParserPlugin(Star):
             },
         )
 
-        with urlopen(request, timeout=20) as response:
+        request_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else DEFAULT_REQUEST_TIMEOUT
+        with urlopen(request, timeout=request_timeout) as response:
             content = response.read().decode("utf-8", errors="ignore")
 
         payload = json.loads(content)
         if not isinstance(payload, dict):
             raise ValueError("接口返回格式异常")
         return payload
+
+    def _get_douyin_profile_timeout(self) -> int:
+        raw_timeout = self.config.get("douyin_profile_timeout", DEFAULT_DOUYIN_PROFILE_TIMEOUT)
+        try:
+            timeout = int(raw_timeout)
+        except (TypeError, ValueError):
+            timeout = DEFAULT_DOUYIN_PROFILE_TIMEOUT
+
+        return max(timeout, DEFAULT_REQUEST_TIMEOUT)
+
+    def _build_douyin_profile_api(self, raw_text: str, api_key: str) -> str:
+        return (
+            DOUYIN_PROFILE_API.format(apikey=quote(api_key, safe=""))
+            + quote(raw_text, safe="")
+            + "&type=1&post=mode&xz=1"
+        )
+
+    def _get_auto_update_interval(self) -> int:
+        raw_interval = self.config.get("douyin_profile_auto_update_interval", DEFAULT_AUTO_UPDATE_INTERVAL)
+        try:
+            interval = int(raw_interval)
+        except (TypeError, ValueError):
+            interval = DEFAULT_AUTO_UPDATE_INTERVAL
+
+        return max(interval, 0)
+
+    def _get_forward_node_uin(self) -> int:
+        raw_uin = self.config.get("forward_node_uin", 0)
+        try:
+            return int(raw_uin)
+        except (TypeError, ValueError):
+            return 0
+
+    def _get_forward_node_name(self, fallback_name: str) -> str:
+        configured_name = str(self.config.get("forward_node_name", "") or "").strip()
+        return configured_name or fallback_name or "聚合解析助手"
+
+    def _build_aggregate_image_forward_node(self, data: Dict[str, Any], image_urls: List[str]) -> Node:
+        fallback_name = str(data.get("author") or data.get("title") or "聚合解析助手").strip() or "聚合解析助手"
+        node_name = self._get_forward_node_name(fallback_name)
+        node_uin = self._get_forward_node_uin()
+        content = [Plain(f"图集共 {len(image_urls)} 张")]
+        content.extend(Image.fromURL(image_url) for image_url in image_urls)
+        return Node(uin=node_uin, name=node_name, content=content)
+
+    def _supports_forward_node(self, event: AstrMessageEvent) -> bool:
+        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").lower()
+        return any(
+            keyword in unified_msg_origin
+            for keyword in ["onebot", "v11", "friendmessage", "groupmessage"]
+        )
+
+    def _is_auto_update_enabled(self) -> bool:
+        return bool(self.config.get("douyin_profile_auto_update_enabled", False))
+
+    def _get_auto_update_time(self) -> str:
+        raw_time = str(self.config.get("douyin_profile_auto_update_time", "") or "").strip()
+        if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", raw_time):
+            return raw_time
+        return ""
+
+    async def _auto_update_loop(self):
+        while True:
+            try:
+                auto_time = self._get_auto_update_time()
+                if not self._is_auto_update_enabled() or not auto_time:
+                    await asyncio.sleep(30)
+                    continue
+
+                now = datetime.now()
+                current_date = now.strftime("%Y-%m-%d")
+                current_time = now.strftime("%H:%M")
+                if self.last_auto_update_check_date != current_date:
+                    self.last_auto_update_check_date = current_date
+                    self.auto_update_state["last_auto_update_check_date"] = current_date
+                    self._save_auto_update_state()
+                    await asyncio.sleep(30)
+                    continue
+                if current_time >= auto_time and self.last_auto_update_date != current_date:
+                    await self._run_auto_update_once()
+                    self.last_auto_update_date = current_date
+                    self.auto_update_state["last_auto_update_date"] = current_date
+                    self.auto_update_state["last_auto_update_check_date"] = current_date
+                    self._save_auto_update_state()
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.exception("定时自动更新检查失败: %s", exc)
+                await asyncio.sleep(30)
+
+    async def _run_auto_update_once(self):
+        if self.auto_update_running:
+            logger.info("自动更新任务仍在执行，跳过本轮定时更新")
+            return
+        if not self.profile_records:
+            logger.info("定时自动更新跳过：暂无主页记录")
+            return
+
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            logger.warning("定时自动更新失败：未配置抖音主页解析 API 密钥")
+            return
+
+        self.auto_update_running = True
+        try:
+            total = len(self.profile_records)
+            logger.info("开始执行定时自动更新，共 %s 个主页记录", total)
+            success_count = 0
+            failed_count = 0
+            auto_update_interval = self._get_auto_update_interval()
+            for index, message in enumerate(self._iter_profile_update_messages(douyin_profile_api_key), start=1):
+                if message.startswith("✅"):
+                    success_count += 1
+                elif message.startswith("❌"):
+                    failed_count += 1
+                else:
+                    logger.info("自动更新跳过项: %s", message.replace("\n", " | "))
+                if index < total and auto_update_interval > 0:
+                    logger.info("自动更新节流等待 %s 秒后继续下一项", auto_update_interval)
+                    await asyncio.sleep(auto_update_interval)
+            logger.info(
+                "抖音主页自动更新全部完成：共 %s 个，成功 %s 个，失败 %s 个",
+                total,
+                success_count,
+                failed_count,
+            )
+            await self._notify_auto_update_summary(total, success_count, failed_count)
+        finally:
+            self.auto_update_running = False
+
+    def _iter_profile_update_messages(self, douyin_profile_api_key: str, records: Optional[List[Dict[str, Any]]] = None):
+        target_records = list(records) if records is not None else list(self.profile_records)
+        total = len(target_records)
+        for index, record in enumerate(target_records, start=1):
+            yield self._update_single_profile_record(douyin_profile_api_key, record, index=index, total=total)
+
+    def _update_single_profile_record(self, douyin_profile_api_key: str, record: Dict[str, Any], index: int, total: int) -> str:
+        raw_text = str(record.get("raw_text") or "").strip()
+        if not raw_text:
+            return f"⚠️ 第 {index}/{total} 个记录缺少主页链接，已跳过"
+
+        author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
+        old_urls = self._load_existing_profile_urls(record)
+        try:
+            api_url = self._build_douyin_profile_api(raw_text, douyin_profile_api_key)
+            payload = self._request_json(api_url, timeout=self._get_douyin_profile_timeout())
+            download_info = self._save_profile_txt(payload)
+            updated_record = self._upsert_profile_record(raw_text, payload)
+            count = payload.get("count") or 0
+            new_urls = self._extract_profile_urls(payload)
+            new_count = len([url for url in new_urls if url not in old_urls])
+            file_name = ""
+            payload_author = self._normalize_author_name(str(payload.get('author') or "").strip())
+            display_author = self._sanitize_markdown_text(payload_author or author)
+            if download_info:
+                file_name = str(download_info.get("file_name") or "").strip()
+            if not file_name:
+                file_name = str(updated_record.get("file_name") or "").strip()
+            display_file_name = self._sanitize_markdown_text(file_name or "未生成")
+            return (
+                f"✅ {index}/{total} 更新完成\n"
+                f"👤 作者：{display_author}\n"
+                f"📦 作品数：{count}\n"
+                f"🆕 新增链接：{new_count}\n"
+                f"📁 文件：{display_file_name}"
+            )
+        except Exception as exc:
+            logger.exception("批量更新抖音主页失败: %s", exc)
+            display_author = self._sanitize_markdown_text(author)
+            display_exc = self._sanitize_markdown_text(str(exc))
+            return (
+                f"❌ {index}/{total} 更新失败\n"
+                f"👤 记录：{display_author}\n"
+                f"原因：{display_exc}"
+            )
+
+    def _sanitize_markdown_text(self, text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return ""
+
+        sanitized = text.replace("\\", "\\\\")
+        for char in ["*", "_", "`", "[", "]", "(", ")", "~", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
+            sanitized = sanitized.replace(char, f"\\{char}")
+        return sanitized
+
+    def _load_auto_update_target(self) -> Dict[str, str]:
+        if not os.path.exists(AUTO_UPDATE_TARGET_FILE):
+            return {}
+
+        try:
+            with open(AUTO_UPDATE_TARGET_FILE, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except Exception as exc:
+            logger.warning("读取自动更新推送目标失败: %s", exc)
+            return {}
+
+        if not isinstance(payload, dict):
+            return {}
+        return payload
+
+    def _save_auto_update_target(self) -> None:
+        try:
+            with open(AUTO_UPDATE_TARGET_FILE, "w", encoding="utf-8") as file:
+                json.dump(self.auto_update_target, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("保存自动更新推送目标失败: %s", exc)
+
+    def _load_auto_update_state(self) -> Dict[str, str]:
+        if not os.path.exists(AUTO_UPDATE_STATE_FILE):
+            return {}
+
+        try:
+            with open(AUTO_UPDATE_STATE_FILE, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except Exception as exc:
+            logger.warning("读取自动更新状态失败: %s", exc)
+            return {}
+
+        if not isinstance(payload, dict):
+            return {}
+        return payload
+
+    def _save_auto_update_state(self) -> None:
+        try:
+            with open(AUTO_UPDATE_STATE_FILE, "w", encoding="utf-8") as file:
+                json.dump(self.auto_update_state, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("保存自动更新状态失败: %s", exc)
+
+    async def _notify_auto_update_summary(self, total: int, success_count: int, failed_count: int):
+        unified_msg_origin = str(self.auto_update_target.get("unified_msg_origin") or "").strip()
+        if not unified_msg_origin:
+            return
+
+        try:
+            message_chain = MessageChain([
+                Plain(
+                    f"✅ 抖音主页自动更新全部完成\n"
+                    f"📦 总数：{total}\n"
+                    f"✔️ 成功：{success_count}\n"
+                    f"❌ 失败：{failed_count}"
+                )
+            ])
+            await self.context.send_message(unified_msg_origin, message_chain)
+        except Exception as exc:
+            logger.exception("发送自动更新汇总消息失败: %s", exc)
+
+    def _find_profile_record_by_keyword(self, keyword: str) -> Optional[Dict[str, Any]]:
+        normalized_keyword = self._sanitize_file_name(keyword).lower()
+        raw_keyword = keyword.strip().lower()
+        for record in self.profile_records:
+            author = self._normalize_author_name(str(record.get("author") or "").strip()).lower()
+            file_name = str(record.get("file_name") or "").strip().lower()
+            file_stem = os.path.splitext(file_name)[0].strip().lower() if file_name else ""
+            normalized_author = self._sanitize_file_name(author).lower() if author else ""
+            if raw_keyword in {author, file_name, file_stem}:
+                return record
+            if normalized_keyword and normalized_keyword in {normalized_author, self._sanitize_file_name(file_stem).lower()}:
+                return record
+        return None
+
+    def _load_existing_profile_urls(self, record: Dict[str, Any]) -> List[str]:
+        file_name = str(record.get("file_name") or "").strip()
+        if not file_name:
+            author = self._normalize_author_name(str(record.get("author") or "").strip())
+            if author:
+                file_name = f"{self._sanitize_file_name(author)}.txt"
+
+        if not file_name:
+            return []
+
+        file_path = self._find_download_txt(file_name)
+        if not file_path or not os.path.exists(file_path):
+            return []
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+                return [line.strip() for line in file if line.strip()]
+        except Exception:
+            return []
+
+    def _extract_profile_urls(self, payload: Dict[str, Any]) -> List[str]:
+        data = payload.get("data")
+        if not isinstance(data, list):
+            return []
+        return [item.strip() for item in data if isinstance(item, str) and item.strip()]
+
+    def _load_profile_records(self) -> List[Dict[str, Any]]:
+        if not os.path.exists(PROFILE_RECORD_FILE):
+            return []
+
+        try:
+            with open(PROFILE_RECORD_FILE, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except Exception as exc:
+            logger.warning("读取抖音主页记录失败: %s", exc)
+            return []
+
+        if not isinstance(payload, list):
+            return []
+
+        records: List[Dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            raw_text = str(item.get("raw_text") or "").strip()
+            if not raw_text:
+                continue
+            records.append(item)
+        return records
+
+    def _save_profile_records(self) -> None:
+        try:
+            with open(PROFILE_RECORD_FILE, "w", encoding="utf-8") as file:
+                json.dump(self.profile_records, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("保存抖音主页记录失败: %s", exc)
+
+    def _upsert_profile_record(self, raw_text: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        normalized_raw_text = raw_text.strip()
+        record: Dict[str, Any] = {
+            "raw_text": normalized_raw_text,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        if isinstance(payload, dict):
+            author = self._normalize_author_name(str(payload.get("author") or "").strip())
+            file_name = ""
+            download = self._extract_download_url(payload)
+            if download:
+                file_name = self._extract_file_name(download)
+            if author:
+                record["author"] = author
+            record["count"] = payload.get("count") or 0
+            if file_name:
+                record["file_name"] = file_name
+
+        for index, item in enumerate(self.profile_records):
+            if str(item.get("raw_text") or "").strip() == normalized_raw_text:
+                merged = {**item, **record}
+                self.profile_records[index] = merged
+                self._save_profile_records()
+                return merged
+
+        self.profile_records.append(record)
+        self._save_profile_records()
+        return record
 
     def _extract_url(self, text: str) -> Optional[str]:
         if not text:
@@ -182,6 +709,20 @@ class MediaParserPlugin(Star):
         cleaned_text = text.strip()
         if cleaned_text.startswith("/dyhome"):
             cleaned_text = cleaned_text[7:].strip()
+        elif cleaned_text.startswith("dyhome"):
+            cleaned_text = cleaned_text[len("dyhome"):].strip()
+
+        return cleaned_text or None
+
+    def _extract_dytrack_text(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        cleaned_text = text.strip()
+        if cleaned_text.startswith("/dytrack"):
+            cleaned_text = cleaned_text[len("/dytrack"):].strip()
+        elif cleaned_text.startswith("dytrack"):
+            cleaned_text = cleaned_text[len("dytrack"):].strip()
 
         return cleaned_text or None
 
@@ -211,6 +752,24 @@ class MediaParserPlugin(Star):
             "&xz=1"
         )
 
+    def _build_account_cookie_submit_api(self, api_key: str, cookie: str, mode: str, filename: str, email: str) -> str:
+        api_url = (
+            f"{DOUYIN_COLLECTION_API.format(apikey=quote(api_key, safe=''))}"
+            f"&cookie={quote(cookie, safe='')}"
+            f"&mode={quote(mode, safe='')}"
+            f"&filename={quote(filename, safe='')}"
+            "&type=1"
+        )
+        if email:
+            api_url += f"&email={quote(email, safe='')}"
+        return api_url
+
+    def _build_account_cookie_query_api(self, api_key: str, job_id: str) -> str:
+        return (
+            f"{DOUYIN_COLLECTION_API.format(apikey=quote(api_key, safe=''))}"
+            f"&job_id={quote(job_id, safe='')}"
+        )
+
     def _extract_collection_query_text(self, text: str) -> Optional[str]:
         if not text:
             return None
@@ -223,7 +782,80 @@ class MediaParserPlugin(Star):
 
         return cleaned_text or None
 
+    def _extract_collection_mode(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        cleaned_text = text.strip()
+        if cleaned_text.startswith("/dycollection"):
+            cleaned_text = cleaned_text[len("/dycollection"):].strip()
+        elif cleaned_text.startswith("dycollection"):
+            cleaned_text = cleaned_text[len("dycollection"):].strip()
+
+        if not cleaned_text:
+            return None
+
+        mode = cleaned_text.split()[0].strip().lower()
+        return mode or None
+
+    def _build_account_export_filename(self, mode: str) -> str:
+        configured = str(self.config.get("douyin_account_filename", "") or "").strip()
+        if configured:
+            return configured if configured.lower().endswith(".txt") else f"{configured}.txt"
+        prefix = "我的喜欢" if mode == "favorite" else "我的收藏"
+        return f"{prefix}.txt"
+
+    def _format_account_cookie_submit_result(self, payload: Dict[str, Any], mode: str, filename: str, email: str) -> str:
+        job_id = self._extract_job_id(payload)
+        mode_label = "喜欢作品" if mode == "favorite" else "收藏作品"
+        msg = str(payload.get("msg") or "任务已提交").strip()
+        lines = [
+            f"✅ {msg}",
+            f"📂 解析类型：{mode_label}",
+            f"📁 导出文件：{filename}",
+            "⚠️ 仅支持解析当前 Cookie 对应账号自己的点赞/收藏内容",
+        ]
+        if email:
+            lines.append(f"📧 通知邮箱：{email}")
+        if job_id:
+            lines.append(f"🆔 任务ID：{job_id}")
+            lines.append(f"🔍 查询命令：/dycollection_query {job_id}")
+        return "\n".join(lines)
+
+    def _format_account_cookie_query_result(self, payload: Dict[str, Any], job_id: str) -> str:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        status = str(data.get("status") or payload.get("status") or "").strip().lower()
+        if status != "done":
+            return (
+                f"🕒 {str(payload.get('msg') or '获取成功').strip()}\n"
+                f"📌 任务状态：{status or 'queued'}\n"
+                f"🆔 任务ID：{job_id}"
+            )
+
+        file_name = str(data.get("filename") or "").strip()
+        download_url = str(data.get("download_url") or "").strip()
+        count = data.get("count") or 0
+        mode = str(data.get("mode") or "collection").strip().lower()
+        mode_label = "喜欢作品" if mode == "favorite" else "收藏作品"
+        if download_url:
+            download_url = self._uppercase_domain(download_url)
+        lines = [
+            f"✅ {str(data.get('message') or payload.get('msg') or '解析完成').strip()}",
+            f"📂 解析类型：{mode_label}",
+            f"📦 数量：{count}",
+            f"🆔 任务ID：{job_id}",
+            "⚠️ 仅支持解析当前 Cookie 对应账号自己的点赞/收藏内容",
+        ]
+        if file_name:
+            lines.append(f"📁 文件名: {file_name}")
+        if download_url:
+            lines.append(f"📥 下载链接：{download_url}")
+        return "\n".join(lines)
+
     def _format_aggregate_result(self, payload: Dict[str, Any]) -> str:
+        return self._format_aggregate_summary(payload, include_image_links=False)
+
+    def _format_aggregate_summary(self, payload: Dict[str, Any], include_image_links: bool = True) -> str:
         code = payload.get("code")
         if code != 200:
             return f"聚合解析失败：{payload.get('msg', '接口未返回成功状态')}"
@@ -239,7 +871,7 @@ class MediaParserPlugin(Star):
         author = data.get("author")
         title = data.get("title")
         if author:
-            lines.append(f"👤 作者：{author}")
+            lines.append(f"👤 作者：{self._normalize_author_name(str(author))}")
         if title:
             lines.append(f"📝 标题：{title}")
 
@@ -255,7 +887,7 @@ class MediaParserPlugin(Star):
         if video_url:
             lines.append("🎬 视频链接：")
             lines.append(video_url)
-        if image_urls:
+        if image_urls and include_image_links:
             lines.append("🖼️ 图片链接：")
             lines.extend([f"{index}. {item}" for index, item in enumerate(image_urls, start=1)])
 
@@ -269,7 +901,7 @@ class MediaParserPlugin(Star):
         if code != 200:
             return f"抖音主页解析失败：{payload.get('msg', '接口未返回成功状态')}"
 
-        author = str(payload.get("author") or "").strip()
+        author = self._normalize_author_name(str(payload.get("author") or "").strip())
         count = payload.get("count") or 0
         raw_download = self._extract_download_url(payload)
         download = self._uppercase_domain(raw_download) if raw_download else ""
@@ -312,7 +944,7 @@ class MediaParserPlugin(Star):
         if not isinstance(data, list):
             return None
 
-        author = str(payload.get("author") or "").strip() or "douyin_profile"
+        author = self._normalize_author_name(str(payload.get("author") or "").strip()) or "douyin_profile"
         file_name = f"{self._sanitize_file_name(author)}.txt"
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         file_path = os.path.join(DOWNLOAD_DIR, file_name)
@@ -326,9 +958,41 @@ class MediaParserPlugin(Star):
 
         return {"file_name": file_name, "file_path": file_path}
 
+    def _list_download_txt_files(self) -> List[str]:
+        if not os.path.isdir(DOWNLOAD_DIR):
+            return []
+
+        file_names = [
+            item for item in os.listdir(DOWNLOAD_DIR)
+            if item.lower().endswith(".txt") and os.path.isfile(os.path.join(DOWNLOAD_DIR, item))
+        ]
+        return sorted(file_names, key=lambda item: os.path.getmtime(os.path.join(DOWNLOAD_DIR, item)), reverse=True)
+
+    def _format_douyin_menu(self, file_names: List[str]) -> str:
+        display_names = [os.path.splitext(item)[0] for item in file_names]
+        rows: List[str] = []
+
+        for start_index in range(0, len(display_names), 3):
+            row_items = []
+            for column_offset, name in enumerate(display_names[start_index:start_index + 3], start=1):
+                index = start_index + column_offset
+                icon = "◉" if index <= 3 else "○"
+                row_items.append(f"{icon} {name}")
+            rows.append("  ".join(row_items))
+
+        lines: List[str] = ["┏━🎵 抖音主页菜单 ━┓", *rows, "┣━ 使用方法", "┃ /dyplay 猫姨", "┗━━━━━━━━━━━━━━┛"]
+        return "\n".join(lines)
+
     def _sanitize_file_name(self, value: str) -> str:
         sanitized = re.sub(r'[\\/:*?"<>|]+', "_", value).strip()
         return sanitized or "douyin_profile"
+
+    def _normalize_author_name(self, value: str) -> str:
+        if not isinstance(value, str) or not value:
+            return ""
+
+        filtered = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", value)
+        return filtered.strip()
 
     def _extract_dyplay_text(self, text: str) -> Optional[str]:
         if not text:
@@ -338,6 +1002,16 @@ class MediaParserPlugin(Star):
             cleaned_text = cleaned_text[len("/dyplay"):].strip()
         elif cleaned_text.startswith("dyplay"):
             cleaned_text = cleaned_text[len("dyplay"):].strip()
+        return cleaned_text or None
+
+    def _extract_dyupdateone_text(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        cleaned_text = text.strip()
+        if cleaned_text.startswith("/dyupdateone"):
+            cleaned_text = cleaned_text[len("/dyupdateone"):].strip()
+        elif cleaned_text.startswith("dyupdateone"):
+            cleaned_text = cleaned_text[len("dyupdateone"):].strip()
         return cleaned_text or None
 
     def _find_download_txt(self, file_key: str) -> Optional[str]:
@@ -350,6 +1024,24 @@ class MediaParserPlugin(Star):
             if os.path.exists(candidate):
                 return candidate
         return None
+
+    def _pick_random_play_index(self, file_path: str, total: int) -> int:
+        if total <= 1:
+            return 0
+
+        history = self.play_history.get(file_path, [])
+        if len(history) >= total:
+            history = []
+
+        available_indexes = [index for index in range(total) if index not in history]
+        if not available_indexes:
+            history = []
+            available_indexes = list(range(total))
+
+        current_index = random.choice(available_indexes)
+        history.append(current_index)
+        self.play_history[file_path] = history
+        return current_index
 
     def _resolve_direct_media_url(self, url: str) -> str:
         if not isinstance(url, str) or not url:
@@ -380,9 +1072,9 @@ class MediaParserPlugin(Star):
         return "\n".join(lines)
 
     def _build_collection_query_api(self, job_id: str) -> str:
-        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
         return (
-            f"{DOUYIN_COLLECTION_API.format(apikey=quote(douyin_profile_api_key, safe=''))}"
+            "http://douyin.zhcnli.cn/api.php"
+            "?apikey=xbTr9ZS52OmC9nqd$Xhs7Z/lY8/Dfv6iyk8VQcFDTtDpb1lsW+K7El+O0fp2WS/CyNpeECSwg9HE66Co7s0bnduaMBH6xee+bT4sCsK9knumlUTVehKZJWP7NoMbcQHQz8d+WnC0sf4hXTlgdldwQUf3UW/oO7Q+j9ebyCg+DSl7VhXxjdr0WF1PXPtKM5+A7Eg4MXrQbi6oQ/iOMsHg2McA0MfgYF+yCeK781UV28VHJ$MGUCMDpgAbnfrBBbAI5h85GQEEUYoL4RN0JxPtve3XgZ6yqRJjqCD/r0iiv/3Sml9nMD2AIxAMFR3aO9A3IZc2Fd4TEce5Jmkmp01Kv3WockLXWcVMESvBnIKb/GUMslFgNgyyHKQw=="
             f"&job_id={quote(job_id, safe='')}"
         )
 
@@ -542,4 +1234,6 @@ class MediaParserPlugin(Star):
         return f"{prefix}{domain.upper()}{rest}"
 
     async def terminate(self):
+        if self.auto_update_task and not self.auto_update_task.done():
+            self.auto_update_task.cancel()
         logger.info("media_parser 插件已卸载")
