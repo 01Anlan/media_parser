@@ -210,8 +210,6 @@ API Key 获取地址：
 
 ![赞助二维码](https://blog.zhcnli.com/wp-content/uploads/2026/04/20260419122856231-sponsor-placeholder.jpg)
 
-- 赞助图片链接：<https://blog.zhcnli.com/wp-content/uploads/2026/04/20260419122856231-sponsor-placeholder.jpg>
-
 ## 相关链接
 
 - [独立部署说明](https://blog.zhcnli.com/876.html)
