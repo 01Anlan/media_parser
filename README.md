@@ -206,7 +206,7 @@ API Key 获取地址：
 如果这个项目对你有帮助，欢迎赞助支持。
 
 > [!NOTE]
-> 赞助二维码图片后续补充，当前先保留占位链接。
+> > 欢迎赞助支持项目持续维护与更新。
 
 ![赞助二维码](https://blog.zhcnli.com/wp-content/uploads/2026/04/20260419122856231-sponsor-placeholder.jpg)
 
