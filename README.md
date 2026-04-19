@@ -114,6 +114,16 @@ AstrBot 聚合解析插件。
   - 解析完成后返回 TXT 下载链接
   - 如需更稳定长期使用，推荐独立部署
 
+#### Cookie 获取说明
+
+- 建议使用浏览器无痕模式登录抖音账号后获取，这样拿到的 Cookie 通常更完整、更稳定。
+- 按 `F12` 打开开发者工具，进入“网络 / Network”。
+- 刷新页面后找到以 `feed` 开头的请求。
+- 打开该请求并复制其中完整的 `Cookie` 请求头内容。
+- 重点确认 Cookie 中包含 `odin_tt` 字段。
+
+![抖音 Cookie 获取说明](https://blog.zhcnli.com/wp-content/uploads/2026/04/20260410201734697-dycookie.jpg)
+
 ## 配置说明
 
 配置界面 schema 位于 [`_conf_schema.json`](_conf_schema.json)。AstrBot 会基于该文件生成图形化配置界面。
@@ -206,7 +216,7 @@ API Key 获取地址：
 如果这个项目对你有帮助，欢迎赞助支持。
 
 > [!NOTE]
-> > 欢迎赞助支持项目持续维护与更新。
+> 欢迎赞助支持项目持续维护与更新。
 
 ![赞助二维码](https://blog.zhcnli.com/wp-content/uploads/2026/04/20260419122856231-sponsor-placeholder.jpg)
 
