@@ -191,7 +191,7 @@ AstrBot 聚合解析插件。
 
 API Key 获取地址：
 
-- 聚合解析 API Key：前往 <https://api.zhcnli.cn/> 获取
+- 聚合解析 API Key：前往 <https://api.zhcnli.com/> 获取
 - 抖音主页解析 / 抖音收藏解析 API Key：前往 <https://douyin.zhcnli.cn/apikey_apply.php> 获取
 
 ### 扩展配置
@@ -235,7 +235,7 @@ API Key 获取地址：
 ## 相关链接
 
 - [独立部署说明](https://blog.zhcnli.com/876.html)
-- [聚合解析 API Key 获取](https://api.zhcnli.cn/)
+- [聚合解析 API Key 获取](https://api.zhcnli.com/)
 - [抖音主页 / 收藏解析 API Key 获取](https://douyin.zhcnli.cn/apikey_apply.php)
 - [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
 - [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)

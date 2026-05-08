@@ -17,8 +17,8 @@ from astrbot.api.star import Context, Star, register
 
 
 AGGREGATE_API = (
-    "https://api.zhcnli.cn/API/jhjx.php"
-    "?apikey={apikey}&url="
+    "https://api.zhcnli.com/api/jhjx/index.php"
+    "?ckey={apikey}&url="
 )
 DOUYIN_PROFILE_API = (
     "http://douyin.zhcnli.cn/api.php"
@@ -1109,9 +1109,9 @@ class MediaParserPlugin(Star):
         return "\n".join(lines)
 
     def _build_collection_query_api(self, job_id: str) -> str:
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
         return (
-            "http://douyin.zhcnli.cn/api.php"
-            "?apikey=xbTr9ZS52OmC9nqd$Xhs7Z/lY8/Dfv6iyk8VQcFDTtDpb1lsW+K7El+O0fp2WS/CyNpeECSwg9HE66Co7s0bnduaMBH6xee+bT4sCsK9knumlUTVehKZJWP7NoMbcQHQz8d+WnC0sf4hXTlgdldwQUf3UW/oO7Q+j9ebyCg+DSl7VhXxjdr0WF1PXPtKM5+A7Eg4MXrQbi6oQ/iOMsHg2McA0MfgYF+yCeK781UV28VHJ$MGUCMDpgAbnfrBBbAI5h85GQEEUYoL4RN0JxPtve3XgZ6yqRJjqCD/r0iiv/3Sml9nMD2AIxAMFR3aO9A3IZc2Fd4TEce5Jmkmp01Kv3WockLXWcVMESvBnIKb/GUMslFgNgyyHKQw=="
+            f"{DOUYIN_COLLECTION_API.format(apikey=quote(douyin_profile_api_key, safe=''))}"
             f"&job_id={quote(job_id, safe='')}"
         )
 
