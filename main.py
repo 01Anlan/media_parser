@@ -39,7 +39,7 @@ DEFAULT_DOUYIN_PROFILE_TIMEOUT = 60
 DEFAULT_AUTO_UPDATE_INTERVAL = 30
 
 
-@register("astrbot_plugin_juhejiexi", "Anlan", "聚合解析与抖音主页解析插件", "v1.0.1")
+@register("astrbot_plugin_juhejiexi", "Anlan", "聚合解析与抖音主页解析插件", "v1.0.0")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -65,6 +65,13 @@ class MediaParserPlugin(Star):
         """OneBot 场景下自动识别普通消息中的链接并执行聚合解析。"""
         if not self._should_auto_parse_onebot_message(event):
             return
+
+        logger.info(
+            "自动聚合解析触发: origin=%s session=%s text=%s",
+            getattr(event, "unified_msg_origin", ""),
+            getattr(event, "session_id", ""),
+            getattr(event, "message_str", ""),
+        )
 
         async for result in self._handle_aggregate_parse(event, require_command=False):
             yield result
@@ -367,7 +374,16 @@ class MediaParserPlugin(Star):
 
     def _is_onebot_event(self, event: AstrMessageEvent) -> bool:
         unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").lower()
-        return any(keyword in unified_msg_origin for keyword in ["onebot", "v11"])
+        if any(keyword in unified_msg_origin for keyword in ["onebot", "v11", "aiocqhttp"]):
+            return True
+
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj is not None:
+            raw_type = str(getattr(message_obj, "type", "") or "").lower()
+            if any(keyword in raw_type for keyword in ["group", "private"]):
+                return True
+
+        return False
 
     def _should_auto_parse_onebot_message(self, event: AstrMessageEvent) -> bool:
         if not self._is_onebot_event(event):
