@@ -1352,16 +1352,49 @@ class MediaParserPlugin(Star):
 
     def _pick_image_urls(self, data: Dict[str, Any]) -> List[str]:
         candidates: List[str] = []
+
+        raw_payload = data.get("raw") if isinstance(data.get("raw"), dict) else {}
+        raw_media = raw_payload.get("media") if isinstance(raw_payload.get("media"), list) else []
+        for item in raw_media:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+            if kind != "image":
+                continue
+            for key in ["url", "preview_url", "download_url"]:
+                candidate_url = item.get(key)
+                if isinstance(candidate_url, str) and candidate_url.startswith(("http://", "https://")):
+                    candidates.append(candidate_url)
+
         for key in ["images", "image", "imgurl", "image_urls", "pics"]:
             value = data.get(key)
             if isinstance(value, list):
-                candidates.extend(
-                    item for item in value if isinstance(item, str) and item.startswith(("http://", "https://"))
-                )
+                for item in value:
+                    if isinstance(item, str) and item.startswith(("http://", "https://")):
+                        candidates.append(item)
+                    elif isinstance(item, dict):
+                        for nested_key in ["url", "preview_url", "download_url"]:
+                            candidate_url = item.get(nested_key)
+                            if isinstance(candidate_url, str) and candidate_url.startswith(("http://", "https://")):
+                                candidates.append(candidate_url)
             elif isinstance(value, str) and value.startswith(("http://", "https://")):
                 candidates.append(value)
 
-        return candidates
+        urls = data.get("urls")
+        if isinstance(urls, list):
+            candidates.extend(
+                item for item in urls if isinstance(item, str) and item.startswith(("http://", "https://"))
+            )
+
+        unique_candidates: List[str] = []
+        seen = set()
+        for item in candidates:
+            if item in seen:
+                continue
+            seen.add(item)
+            unique_candidates.append(item)
+
+        return unique_candidates
 
     def _collect_candidate_urls(self, data: Dict[str, Any]) -> List[str]:
         urls: List[str] = []
